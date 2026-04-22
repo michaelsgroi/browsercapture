@@ -1,0 +1,6 @@
+*.har
+__pycache__/
+*.pyc
+.venv/
+.claude/
+.idea/
