@@ -38,7 +38,13 @@ Open directly to a URL:
 ./browsercapture.sh https://myapp.example.com/dashboard
 ```
 
-Save to a specific file:
+Save to a named file (`.har` extension added automatically):
+
+```bash
+./browsercapture.sh my_har_file
+```
+
+Open a URL and save to a specific file:
 
 ```bash
 ./browsercapture.sh https://example.com --output session.har

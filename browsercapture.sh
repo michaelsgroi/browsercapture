@@ -27,7 +27,13 @@ while [[ $# -gt 0 ]]; do
         --raw)      RAW=true; shift ;;
         -h|--help)  usage ;;
         -*)         echo "Unknown option: $1" >&2; usage ;;
-        *)          URL="$1"; shift ;;
+        *)          if [[ "$1" == *://* ]]; then
+                        URL="$1"
+                    else
+                        OUTPUT="$1"
+                        [[ "$OUTPUT" != *.har ]] && OUTPUT="$OUTPUT.har"
+                    fi
+                    shift ;;
     esac
 done
 
