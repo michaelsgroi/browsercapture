@@ -124,14 +124,32 @@ def _wait_for_enter(event):
     event.set()
 
 
-def capture(url=None, output=None):
+def _wait_for_signal_file(signal_file, event, check_interval=0.5):
+    """Poll for signal file existence."""
+    while not event.is_set():
+        if os.path.exists(signal_file):
+            event.set()
+            return
+        threading.Event().wait(check_interval)
+
+
+def capture(url=None, output=None, signal_file=None):
     if output is None:
         ts = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
         output = f"/tmp/browsercapture-{ts}.har"
 
     stop_event = threading.Event()
-    enter_thread = threading.Thread(target=_wait_for_enter, args=(stop_event,), daemon=True)
-    enter_thread.start()
+
+    if signal_file:
+        # Background mode: poll for signal file
+        signal_thread = threading.Thread(
+            target=_wait_for_signal_file, args=(signal_file, stop_event), daemon=True
+        )
+        signal_thread.start()
+    else:
+        # Interactive mode: wait for Enter
+        enter_thread = threading.Thread(target=_wait_for_enter, args=(stop_event,), daemon=True)
+        enter_thread.start()
 
     p = sync_playwright().start()
     user_data_dir = tempfile.mkdtemp(prefix="browsercapture_")
@@ -160,7 +178,11 @@ def capture(url=None, output=None):
         print(f"Browser open at: {url}", file=sys.stderr)
     else:
         print("Browser open. Navigate wherever you like.", file=sys.stderr)
-    print("Press Enter here when done.", file=sys.stderr)
+
+    if signal_file:
+        print(f"Waiting for finish signal...", file=sys.stderr)
+    else:
+        print("Press Enter here when done.", file=sys.stderr)
 
     stop_event.wait()
 
@@ -172,7 +194,8 @@ def capture(url=None, output=None):
     else:
         p.stop()
         print("Browser was closed directly — HAR file was not saved.", file=sys.stderr)
-        print("Next time, press Enter here instead of closing the browser.", file=sys.stderr)
+        if not signal_file:
+            print("Next time, press Enter here instead of closing the browser.", file=sys.stderr)
         return None
 
 
@@ -313,6 +336,8 @@ def main():
     cap = sub.add_parser("capture", help="Launch browser and record HAR")
     cap.add_argument("--url", default=None, help="URL to open (default: blank tab)")
     cap.add_argument("--output", default=None, help="HAR output path")
+    cap.add_argument("--background", action="store_true", help="Background mode (poll for signal file)")
+    cap.add_argument("signal_file", nargs="?", default=None, help="Signal file path for background mode")
 
     filt = sub.add_parser("filter", help="Filter noise from a HAR file")
     filt.add_argument("input", help="HAR file to filter")
@@ -326,6 +351,7 @@ def main():
         result = capture(
             url=getattr(args, "url", None),
             output=getattr(args, "output", None),
+            signal_file=getattr(args, "signal_file", None),
         )
         if result is None:
             sys.exit(1)
