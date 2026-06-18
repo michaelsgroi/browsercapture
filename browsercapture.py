@@ -76,20 +76,21 @@ def _truncate(text, max_size=MAX_BODY_SIZE):
     return text
 
 
-def filter_har(har):
+def filter_har(har, truncate_bodies=False):
     entries = har.get("log", {}).get("entries", [])
     filtered = []
     for entry in entries:
         if _is_noise(entry):
             continue
-        if "response" in entry and "content" in entry["response"]:
-            content = entry["response"]["content"]
-            if "text" in content:
-                content["text"] = _truncate(content["text"])
-        if "request" in entry and "postData" in entry["request"]:
-            pd = entry["request"]["postData"]
-            if "text" in pd:
-                pd["text"] = _truncate(pd["text"])
+        if truncate_bodies:
+            if "response" in entry and "content" in entry["response"]:
+                content = entry["response"]["content"]
+                if "text" in content:
+                    content["text"] = _truncate(content["text"])
+            if "request" in entry and "postData" in entry["request"]:
+                pd = entry["request"]["postData"]
+                if "text" in pd:
+                    pd["text"] = _truncate(pd["text"])
         filtered.append(entry)
 
     har["log"]["entries"] = filtered
@@ -160,9 +161,16 @@ def capture(url=None, output=None, signal_file=None):
         channel="chrome",
         viewport={"width": 1400, "height": 900},
         record_har_path=output,
+        record_har_mode="full",
+        record_har_content="embed",
     )
 
     page = context.pages[0] if context.pages else context.new_page()
+
+    cdp = context.new_cdp_session(page)
+    cdp.send("Network.enable")
+    cdp.send("Network.setCacheDisabled", {"cacheDisabled": True})
+
     if url:
         page.goto(url, wait_until="domcontentloaded")
 
@@ -241,7 +249,7 @@ def _mcp_do_capture(req, args):
 
     with open(output) as f:
         har = json.load(f)
-    har = filter_har(har)
+    har = filter_har(har, truncate_bodies=True)
 
     return {
         "jsonrpc": "2.0",
@@ -257,7 +265,7 @@ def _mcp_do_filter(req, args):
 
     with open(path) as f:
         har = json.load(f)
-    har = filter_har(har)
+    har = filter_har(har, truncate_bodies=True)
 
     return {
         "jsonrpc": "2.0",
