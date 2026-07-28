@@ -4,6 +4,7 @@
 import argparse
 from datetime import datetime, timezone
 import json
+import logging
 import os
 import re
 import subprocess
@@ -134,6 +135,14 @@ def _wait_for_signal_file(signal_file, event, check_interval=0.5):
         threading.Event().wait(check_interval)
 
 
+class _TargetClosedFilter(logging.Filter):
+    def filter(self, record):
+        return "TargetClosedError" not in record.getMessage()
+
+
+logging.getLogger("asyncio").addFilter(_TargetClosedFilter())
+
+
 def capture(url=None, output=None, signal_file=None):
     if output is None:
         ts = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
@@ -142,28 +151,88 @@ def capture(url=None, output=None, signal_file=None):
     stop_event = threading.Event()
 
     if signal_file:
-        # Background mode: poll for signal file
         signal_thread = threading.Thread(
             target=_wait_for_signal_file, args=(signal_file, stop_event), daemon=True
         )
         signal_thread.start()
     else:
-        # Interactive mode: wait for Enter
         enter_thread = threading.Thread(target=_wait_for_enter, args=(stop_event,), daemon=True)
         enter_thread.start()
 
     p = sync_playwright().start()
     user_data_dir = tempfile.mkdtemp(prefix="browsercapture_")
 
+    # Don't use record_har_* — context.close() hangs waiting for Chrome to flush
+    # the HAR, which never completes reliably. Capture via event listeners instead.
     context = p.chromium.launch_persistent_context(
         user_data_dir,
         headless=False,
         channel="chrome",
         viewport={"width": 1400, "height": 900},
-        record_har_path=output,
-        record_har_mode="full",
-        record_har_content="embed",
     )
+
+    har_entries = []
+    har_lock = threading.Lock()
+
+    def on_requestfinished(request):
+        try:
+            started = datetime.now(timezone.utc).isoformat()
+            response = request.response()
+            if response is None:
+                return
+            try:
+                body_bytes = response.body()
+                body_text = body_bytes.decode("utf-8", errors="replace")
+                body_size = len(body_bytes)
+            except Exception:
+                body_text = ""
+                body_size = -1
+
+            post_data = None
+            if request.post_data:
+                post_data = {
+                    "mimeType": request.headers.get("content-type", ""),
+                    "text": request.post_data,
+                }
+
+            entry = {
+                "startedDateTime": started,
+                "time": -1,
+                "request": {
+                    "method": request.method,
+                    "url": request.url,
+                    "httpVersion": "HTTP/1.1",
+                    "headers": [{"name": k, "value": v} for k, v in request.headers.items()],
+                    "queryString": [],
+                    "cookies": [],
+                    "headersSize": -1,
+                    "bodySize": len(request.post_data.encode()) if request.post_data else 0,
+                    **({"postData": post_data} if post_data else {}),
+                },
+                "response": {
+                    "status": response.status,
+                    "statusText": response.status_text,
+                    "httpVersion": "HTTP/1.1",
+                    "headers": [{"name": k, "value": v} for k, v in response.headers.items()],
+                    "cookies": [],
+                    "content": {
+                        "size": body_size,
+                        "mimeType": response.headers.get("content-type", ""),
+                        **({"text": body_text} if body_text else {}),
+                    },
+                    "redirectURL": response.headers.get("location", ""),
+                    "headersSize": -1,
+                    "bodySize": body_size,
+                },
+                "cache": {},
+                "timings": {"send": 0, "wait": 0, "receive": 0},
+            }
+            with har_lock:
+                har_entries.append(entry)
+        except Exception:
+            pass
+
+    context.on("requestfinished", on_requestfinished)
 
     page = context.pages[0] if context.pages else context.new_page()
 
@@ -192,19 +261,44 @@ def capture(url=None, output=None, signal_file=None):
     else:
         print("Press Enter here when done.", file=sys.stderr)
 
-    stop_event.wait()
+    # Must pump the Playwright event loop while waiting, otherwise requestfinished
+    # events never fire during browsing (they queue up and only flush on close).
+    while not stop_event.is_set() and not browser_closed.is_set():
+        try:
+            page.wait_for_timeout(500)
+        except Exception:
+            break
+
+    with har_lock:
+        snapshot = list(har_entries)
+
+    har = {
+        "log": {
+            "version": "1.2",
+            "creator": {"name": "browsercapture", "version": "0.1.0"},
+            "entries": snapshot,
+        }
+    }
+    with open(output, "w") as f:
+        json.dump(har, f, indent=2)
 
     if not browser_closed.is_set():
-        context.close()
-        p.stop()
-        print(f"HAR saved: {output}", file=sys.stderr)
-        return output
+        try:
+            context.close()
+        except Exception:
+            pass
+        try:
+            p.stop()
+        except Exception:
+            pass
     else:
-        p.stop()
-        print("Browser was closed directly — HAR file was not saved.", file=sys.stderr)
-        if not signal_file:
-            print("Next time, press Enter here instead of closing the browser.", file=sys.stderr)
-        return None
+        try:
+            p.stop()
+        except Exception:
+            pass
+
+    print(f"HAR saved: {output} ({len(snapshot)} entries)", file=sys.stderr)
+    return output
 
 
 # --- MCP server ---

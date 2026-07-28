@@ -35,8 +35,9 @@ if [[ $# -eq 1 && "$1" == "finish" ]]; then
         exit 1
     fi
 
-    # Read state file to get signal file path
+    # Read state file to get signal file path and python pid
     SIGNAL_FILE=$(jq -r '.signal_file' "$STATE_FILE" 2>/dev/null)
+    PYTHON_PID=$(jq -r '.python_pid // empty' "$STATE_FILE" 2>/dev/null)
     if [[ -z "$SIGNAL_FILE" || "$SIGNAL_FILE" == "null" ]]; then
         echo "Invalid state file." >&2
         exit 1
@@ -46,13 +47,20 @@ if [[ $# -eq 1 && "$1" == "finish" ]]; then
     touch "$SIGNAL_FILE"
     echo "Signaling browser to stop..."
 
-    # Wait for process to finish (up to 10 seconds)
-    for i in {1..20}; do
+    # Wait for process to finish (up to 40 seconds — HAR flush can take time)
+    for i in {1..80}; do
         if [[ ! -f "$STATE_FILE" ]]; then
             break
         fi
         sleep 0.5
     done
+
+    # If still not done, kill the python process so Chrome releases the HAR
+    if [[ -f "$STATE_FILE" && -n "$PYTHON_PID" ]]; then
+        echo "Timed out waiting; forcing stop..." >&2
+        kill "$PYTHON_PID" 2>/dev/null || true
+        rm -f "$STATE_FILE" "$SIGNAL_FILE"
+    fi
 
     exit 0
 fi
@@ -86,10 +94,7 @@ fi
 if [[ "$BACKGROUND" == true ]]; then
     CAPTURE_ARGS+=(--background)
 
-    # Create state file with session info
     SIGNAL_FILE="/tmp/browsercapture-signal-$$.tmp"
-    jq -n --arg signal "$SIGNAL_FILE" --arg output "$OUTPUT" \
-        '{signal_file: $signal, output: $output, pid: '$$'}' > "$STATE_FILE"
 
     if [[ -n "$URL" ]]; then
         echo "Launching browser for: $URL (background mode)"
@@ -101,16 +106,23 @@ if [[ "$BACKGROUND" == true ]]; then
     echo "When done browsing, run: ./browsercapture.sh finish"
     echo ""
 
-    # Run in background
+    # Run in background; capture python PID so finish can kill it on timeout
     (
-        python3 "$SCRIPT_DIR/browsercapture.py" "${CAPTURE_ARGS[@]}" "$SIGNAL_FILE"
+        python3 "$SCRIPT_DIR/browsercapture.py" "${CAPTURE_ARGS[@]}" "$SIGNAL_FILE" &
+        PYTHON_PID=$!
 
-        if [[ "$RAW" == false ]]; then
+        # Write state file now that we have the python PID
+        jq -n --arg signal "$SIGNAL_FILE" --arg output "$OUTPUT" --argjson ppid "$PYTHON_PID" \
+            '{signal_file: $signal, output: $output, python_pid: $ppid}' > "$STATE_FILE"
+
+        wait "$PYTHON_PID"
+
+        if [[ "$RAW" == false && -f "$OUTPUT" ]]; then
             RAW_SIZE=$(wc -c < "$OUTPUT" | tr -d ' ')
             python3 "$SCRIPT_DIR/browsercapture.py" filter "$OUTPUT" -o "$OUTPUT"
             SIZE=$(wc -c < "$OUTPUT" | tr -d ' ')
             echo "HAR saved: $OUTPUT ($SIZE bytes, filtered from $RAW_SIZE)"
-        else
+        elif [[ -f "$OUTPUT" ]]; then
             SIZE=$(wc -c < "$OUTPUT" | tr -d ' ')
             echo "HAR saved: $OUTPUT ($SIZE bytes, unfiltered)"
         fi
