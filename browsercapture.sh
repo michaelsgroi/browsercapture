@@ -6,20 +6,24 @@ OUTPUT=""
 URL=""
 RAW=false
 BACKGROUND=false
+AUTH_OUTPUT=""
 STATE_FILE="/tmp/browsercapture.state"
 
 usage() {
     cat <<'USAGE'
 Usage: browsercapture.sh [url] [options]
        browsercapture.sh finish
+       browsercapture.sh start [url] [options]
 
 Options:
-  --output FILE      HAR output path (default: /tmp/browsercapture-<timestamp>.har)
+  --output FILE      HAR output path (default: /tmp/<timestamp>.har)
   --raw              Keep all traffic (static assets, telemetry, browser internals)
   --background       Launch browser and return immediately (use 'finish' to stop)
+  --auth-output FILE Credential JSON path (optional)
   -h, --help         Show this help
 
 Commands:
+  start              Start a capture (optional; also the default behavior)
   finish             Stop background browser session and save HAR
 
 If no URL is provided, the browser opens to a blank tab.
@@ -65,11 +69,16 @@ if [[ $# -eq 1 && "$1" == "finish" ]]; then
     exit 0
 fi
 
+if [[ $# -gt 0 && "$1" == "start" ]]; then
+    shift
+fi
+
 while [[ $# -gt 0 ]]; do
     case "$1" in
         --output)      OUTPUT="$2"; shift 2 ;;
         --raw)         RAW=true; shift ;;
         --background)  BACKGROUND=true; shift ;;
+        --auth-output)  AUTH_OUTPUT="$2"; shift 2 ;;
         -h|--help)     usage ;;
         -*)            echo "Unknown option: $1" >&2; usage ;;
         *)             if [[ "$1" == *://* ]]; then
@@ -83,12 +92,15 @@ while [[ $# -gt 0 ]]; do
 done
 
 if [[ -z "$OUTPUT" ]]; then
-    OUTPUT="/tmp/browsercapture-$(date -u +%Y%m%dT%H%M%SZ).har"
+    OUTPUT="/tmp/$(date -u +%Y%m%dT%H%M%SZ).har"
 fi
 
 CAPTURE_ARGS=(capture --output "$OUTPUT")
 if [[ -n "$URL" ]]; then
     CAPTURE_ARGS+=(--url "$URL")
+fi
+if [[ -n "$AUTH_OUTPUT" ]]; then
+    CAPTURE_ARGS+=(--auth-output "$AUTH_OUTPUT")
 fi
 
 if [[ "$BACKGROUND" == true ]]; then

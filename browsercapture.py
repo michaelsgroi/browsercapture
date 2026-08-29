@@ -11,6 +11,9 @@ import subprocess
 import sys
 import tempfile
 import threading
+import urllib.error
+import urllib.request
+from http.cookies import SimpleCookie
 from urllib.parse import urlparse
 
 from playwright.sync_api import sync_playwright
@@ -43,6 +46,22 @@ ANALYTICS_DOMAINS = {
 }
 
 MAX_BODY_SIZE = 8000
+
+SENSITIVE_HEADER_NAMES = {
+    "authorization",
+    "cookie",
+    "proxy-authorization",
+    "set-cookie",
+    "x-api-key",
+    "x-auth-token",
+    "x-csrf-token",
+    "x-csrftoken",
+    "x-xsrf-token",
+}
+
+AUTH_WARNING = (
+    "Contains live browser credentials and request data. Do not share or commit this file."
+)
 
 
 def _is_noise(entry):
@@ -116,6 +135,101 @@ def filter_har_file(input_path, output_path=None):
         print(output)
 
 
+def _safe_headers(headers):
+    """Return headers that are safe for the normal, shareable HAR."""
+    return [
+        {"name": name, "value": value}
+        for name, value in headers.items()
+        if name.lower() not in SENSITIVE_HEADER_NAMES
+    ]
+
+
+def _har_cookies(headers, header_name):
+    """Convert Cookie/Set-Cookie headers into HAR cookie objects."""
+    cookies = []
+    for header in headers:
+        if header["name"].lower() != header_name.lower():
+            continue
+        parsed = SimpleCookie()
+        parsed.load(header["value"])
+        for morsel in parsed.values():
+            cookies.append({"name": morsel.key, "value": morsel.value})
+    return cookies
+
+
+def _header_array(headers):
+    """Normalize Playwright's NameValue dictionaries for JSON output."""
+    return [{"name": header["name"], "value": header["value"]} for header in headers]
+
+
+def _complete_headers(message):
+    """Get wire headers, preserving duplicates when Playwright supports it."""
+    try:
+        return _header_array(message.headers_array())
+    except Exception:
+        return [
+            {"name": name, "value": value}
+            for name, value in message.all_headers().items()
+        ]
+
+
+def _default_auth_output(har_output):
+    stem, extension = os.path.splitext(har_output)
+    if extension.lower() == ".har":
+        return f"{stem}.auth.json"
+    return f"{har_output}.auth.json"
+
+
+def _write_private_json(path, value):
+    """Write credential-bearing JSON with owner-only permissions."""
+    flags = os.O_WRONLY | os.O_CREAT | os.O_TRUNC
+    if hasattr(os, "O_NOFOLLOW"):
+        flags |= os.O_NOFOLLOW
+    fd = os.open(path, flags, 0o600)
+    try:
+        os.fchmod(fd, 0o600)
+        with os.fdopen(fd, "w") as auth_file:
+            fd = None
+            json.dump(value, auth_file, indent=2)
+            auth_file.write("\n")
+    finally:
+        if fd is not None:
+            os.close(fd)
+
+
+def replay_auth_request(auth_path, request_id):
+    """Replay one captured request without displaying its credential values."""
+    with open(auth_path) as auth_file:
+        auth_data = json.load(auth_file)
+
+    captured = next(
+        (item for item in auth_data.get("requests", []) if item.get("requestId") == request_id),
+        None,
+    )
+    if captured is None:
+        raise ValueError(f"request ID {request_id} not found in credential file")
+
+    excluded = {"content-length", "host", "connection", "transfer-encoding"}
+    headers = {
+        item["name"]: item["value"]
+        for item in captured.get("headers", [])
+        if item["name"].lower() not in excluded and not item["name"].startswith(":")
+    }
+    post_data = captured.get("postData")
+    data = post_data.encode("utf-8") if post_data is not None else None
+    replay_request = urllib.request.Request(
+        captured["url"],
+        data=data,
+        headers=headers,
+        method=captured["method"],
+    )
+    try:
+        with urllib.request.urlopen(replay_request) as response:
+            return response.status
+    except urllib.error.HTTPError as error:
+        return error.code
+
+
 # --- Browser capture ---
 
 def _wait_for_enter(event):
@@ -143,10 +257,14 @@ class _TargetClosedFilter(logging.Filter):
 logging.getLogger("asyncio").addFilter(_TargetClosedFilter())
 
 
-def capture(url=None, output=None, signal_file=None):
+def capture(url=None, output=None, signal_file=None, capture_auth=True, auth_output=None):
     if output is None:
         ts = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
-        output = f"/tmp/browsercapture-{ts}.har"
+        output = f"/tmp/{ts}.har"
+    if capture_auth:
+        auth_output = auth_output or _default_auth_output(output)
+        if os.path.abspath(auth_output) == os.path.abspath(output):
+            raise ValueError("auth output must be different from HAR output")
 
     stop_event = threading.Event()
 
@@ -172,6 +290,7 @@ def capture(url=None, output=None, signal_file=None):
     )
 
     har_entries = []
+    auth_requests = []
     har_lock = threading.Lock()
 
     def on_requestfinished(request):
@@ -195,6 +314,9 @@ def capture(url=None, output=None, signal_file=None):
                     "text": request.post_data,
                 }
 
+            request_headers = request.headers
+            response_headers = response.headers
+
             entry = {
                 "startedDateTime": started,
                 "time": -1,
@@ -202,9 +324,9 @@ def capture(url=None, output=None, signal_file=None):
                     "method": request.method,
                     "url": request.url,
                     "httpVersion": "HTTP/1.1",
-                    "headers": [{"name": k, "value": v} for k, v in request.headers.items()],
+                    "headers": _complete_headers(request),
                     "queryString": [],
-                    "cookies": [],
+                    "cookies": _har_cookies(_complete_headers(request), "cookie"),
                     "headersSize": -1,
                     "bodySize": len(request.post_data.encode()) if request.post_data else 0,
                     **({"postData": post_data} if post_data else {}),
@@ -213,8 +335,8 @@ def capture(url=None, output=None, signal_file=None):
                     "status": response.status,
                     "statusText": response.status_text,
                     "httpVersion": "HTTP/1.1",
-                    "headers": [{"name": k, "value": v} for k, v in response.headers.items()],
-                    "cookies": [],
+                    "headers": _complete_headers(response),
+                    "cookies": _har_cookies(_complete_headers(response), "set-cookie"),
                     "content": {
                         "size": body_size,
                         "mimeType": response.headers.get("content-type", ""),
@@ -227,7 +349,23 @@ def capture(url=None, output=None, signal_file=None):
                 "cache": {},
                 "timings": {"send": 0, "wait": 0, "receive": 0},
             }
+
+            auth_request = None
+            if capture_auth:
+                auth_request = {
+                    "requestId": None,
+                    "startedDateTime": started,
+                    "method": request.method,
+                    "url": request.url,
+                    "headers": _complete_headers(request),
+                    **({"postData": request.post_data} if request.post_data else {}),
+                }
             with har_lock:
+                request_id = len(har_entries)
+                entry["_browsercaptureRequestId"] = request_id
+                if auth_request is not None:
+                    auth_request["requestId"] = request_id
+                    auth_requests.append(auth_request)
                 har_entries.append(entry)
         except Exception:
             pass
@@ -276,11 +414,26 @@ def capture(url=None, output=None, signal_file=None):
         "log": {
             "version": "1.2",
             "creator": {"name": "browsercapture", "version": "0.1.0"},
+            "comment": "This HAR may contain live browser credentials.",
             "entries": snapshot,
         }
     }
     with open(output, "w") as f:
         json.dump(har, f, indent=2)
+
+    if capture_auth:
+        storage_state = context.storage_state()
+        with har_lock:
+            auth_snapshot = list(auth_requests)
+        auth_data = {
+            "version": 1,
+            "warning": AUTH_WARNING,
+            "harFile": os.path.abspath(output),
+            "capturedAt": datetime.now(timezone.utc).isoformat(),
+            "storageState": storage_state,
+            "requests": auth_snapshot,
+        }
+        _write_private_json(auth_output, auth_data)
 
     if not browser_closed.is_set():
         try:
@@ -298,6 +451,11 @@ def capture(url=None, output=None, signal_file=None):
             pass
 
     print(f"HAR saved: {output} ({len(snapshot)} entries)", file=sys.stderr)
+    if capture_auth:
+        print(
+            f"Credentials saved: {auth_output} (mode 0600; contains live credentials)",
+            file=sys.stderr,
+        )
     return output
 
 
@@ -330,11 +488,13 @@ def _error_response(req_id, code, message):
 
 def _mcp_do_capture(req, args):
     ts = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
-    output = args.get("output", f"/tmp/browsercapture-{ts}.har")
+    output = args.get("output", f"/tmp/{ts}.har")
 
     cmd = [sys.executable, __file__, "capture", "--output", output]
     if "url" in args:
         cmd += ["--url", args["url"]]
+    if "auth_output" in args:
+        cmd += ["--auth-output", args["auth_output"]]
 
     result = subprocess.run(cmd, capture_output=False)
 
@@ -378,6 +538,10 @@ def serve_mcp():
                 "properties": {
                     "url": {"type": "string", "description": "URL to open (optional, blank tab if omitted)"},
                     "output": {"type": "string", "description": "HAR output file path (optional)"},
+                    "auth_output": {
+                        "type": "string",
+                        "description": "Credential file path (optional)",
+                    },
                 },
             },
         },
@@ -439,11 +603,16 @@ def main():
     cap.add_argument("--url", default=None, help="URL to open (default: blank tab)")
     cap.add_argument("--output", default=None, help="HAR output path")
     cap.add_argument("--background", action="store_true", help="Background mode (poll for signal file)")
+    cap.add_argument("--auth-output", default=None, help="Credential JSON output path")
     cap.add_argument("signal_file", nargs="?", default=None, help="Signal file path for background mode")
 
     filt = sub.add_parser("filter", help="Filter noise from a HAR file")
     filt.add_argument("input", help="HAR file to filter")
     filt.add_argument("--output", "-o", default=None, help="Output file (default: stdout)")
+
+    replay = sub.add_parser("replay", help="Replay one request from a protected auth file")
+    replay.add_argument("auth_file", help="Credential JSON created alongside a capture")
+    replay.add_argument("--request-id", required=True, type=int, help="HAR request ID to replay")
 
     sub.add_parser("mcp", help="Run as MCP server")
 
@@ -454,11 +623,19 @@ def main():
             url=getattr(args, "url", None),
             output=getattr(args, "output", None),
             signal_file=getattr(args, "signal_file", None),
+            capture_auth=True,
+            auth_output=getattr(args, "auth_output", None),
         )
         if result is None:
             sys.exit(1)
     elif args.command == "filter":
         filter_har_file(args.input, args.output)
+    elif args.command == "replay":
+        try:
+            status = replay_auth_request(args.auth_file, args.request_id)
+        except (OSError, ValueError, json.JSONDecodeError) as error:
+            parser.error(str(error))
+        print(f"Replay status: {status}")
     elif args.command == "mcp":
         serve_mcp()
 

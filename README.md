@@ -15,7 +15,8 @@ playwright install chrome
 ./browsercapture.sh
 
 # Browser opens → navigate around → press Enter when done
-# HAR saved to /tmp/browsercapture-<timestamp>.har
+# HAR saved to /tmp/<timestamp>.har
+# Credentials saved to /tmp/<timestamp>.auth.json (mode 0600)
 ```
 
 **That's it!** The HAR file contains all HTTP traffic, filtered to show just the important stuff (APIs, XHR, etc.).
@@ -35,14 +36,14 @@ playwright install chrome
 2. Chrome opens with HAR recording enabled via Playwright
 3. You do whatever you need to do in the browser (login, navigate, call APIs, etc.)
 4. Press Enter in the terminal when done
-5. HAR file is saved to `/tmp/browsercapture-<timestamp>.har` (or a path you specify)
+5. HAR and its protected credential file are saved to `/tmp/<timestamp>.har` and `/tmp/<timestamp>.auth.json` (or paths you specify)
 
 ### Background Mode (for automation/Claude)
 1. Run `./browsercapture.sh --background [url]`
 2. Browser opens and script returns immediately
 3. You do whatever you need to do in the browser
 4. Run `./browsercapture.sh finish` when done
-5. HAR file is saved and filtered automatically
+5. HAR and protected credentials are saved and the HAR is filtered automatically
 
 ## Prerequisites
 
@@ -111,6 +112,15 @@ Keep all traffic including static assets, telemetry, and browser internals:
 ```
 
 By default the HAR is filtered to remove noise (static assets, analytics, browser internals, OPTIONS preflights, etc.). Use `--raw` to keep everything.
+
+Every capture also writes a credential-bearing HAR and a protected storage snapshot. For the
+default timestamped output these are `/tmp/<timestamp>.har` and `/tmp/<timestamp>.auth.json`.
+The auth file is mode `0600`; both files may contain live credentials and must not be shared.
+Replay a captured request with:
+
+```bash
+python3 browsercapture.py replay /tmp/<timestamp>.auth.json --request-id 42
+```
 
 ## Common Use Cases
 
